@@ -1,0 +1,30 @@
+# render.yaml — مخطّط نشر تلقائي على Render (الخطة المجانية)
+# عند ربط المستودع بـ Render سيقرأ هذا الملف ويطلب منك تعبئة القيم السرّية.
+services:
+  - type: web
+    name: report-system
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: SECURE_COOKIE
+        value: "1"
+      # يولّد Render سرًّا عشوائيًا تلقائيًا لتوقيع الجلسات:
+      - key: SESSION_SECRET
+        generateValue: true
+      # الصقها من Neon (قاعدة بيانات Postgres المجانية):
+      - key: DATABASE_URL
+        sync: false
+      # بيانات مدير النظام الأول:
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ORG_NAME
+        value: "إدارة الجودة وتجربة المستفيد"
+      - key: PROGRAM_NAME
+        value: "برنامج الزائر السري"
