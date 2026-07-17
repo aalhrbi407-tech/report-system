@@ -284,12 +284,12 @@ app.put("/api/settings/org", requireAuth, requirePerm("manage_settings"), asyncH
 }));
 
 /* =========================================================
-   STATIC HOSTING (frontend)
+   STATIC HOSTING (frontend embedded — no external folder)
    ========================================================= */
-app.use(express.static(path.join(__dirname, "public"), { index: "index.html", maxAge: "1h" }));
+const HTML = require("./frontend");
 app.get("*", (req, res) => {
   if (req.path.startsWith("/api/")) return res.status(404).json({ error: "غير موجود." });
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.type("html").send(HTML);
 });
 
 /* error guard */
