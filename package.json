@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "seed:demo": "node seed-cli.js --demo",
-    "reset": "node seed-cli.js --reset"
+    "reset": "node seed-cli.js --reset",
+    "clear:assignments": "node seed-cli.js --clear-assignments"
   },
   "engines": {
     "node": ">=18.0.0"

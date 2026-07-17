@@ -24,6 +24,14 @@ app.use(express.json({ limit: "1mb" }));
 /* ---------- helpers ---------- */
 function clampInt(v, min, max, dflt) { let n = parseInt(v, 10); if (isNaN(n)) n = dflt; return Math.max(min, Math.min(max, n)); }
 function sanitizeExtra(arr) { return Array.isArray(arr) ? arr.filter(p => D.PERMS.includes(p)) : []; }
+// يبقي فقط المعرّفات التي تخصّ مشرفين فعليين
+async function sanitizeSupervisors(arr) {
+  if (!Array.isArray(arr)) return [];
+  const ids = arr.filter(x => typeof x === "string");
+  if (!ids.length) return [];
+  const rows = (await D.query("SELECT id FROM users WHERE role='manager'")).rows.map(r => r.id);
+  return ids.filter(id => rows.includes(id));
+}
 function asyncH(fn) { return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next); }
 
 /* =========================================================
@@ -136,6 +144,7 @@ app.post("/api/reports/:id/submit", requireAuth, requirePerm("submit_reports"), 
 app.post("/api/reports/:id/approve", requireAuth, requirePerm("review_reports"), asyncH(async (req, res) => {
   const r = await D.getReportById(req.params.id);
   if (!r) return res.status(404).json({ error: "التقرير غير موجود." });
+  if (!(await D.canManage(req.user, r.employee_id))) return res.status(403).json({ error: "هذا التقرير ليس ضمن فريقك." });
   if (r.status !== "review") return res.status(400).json({ error: "لا يمكن اعتماد تقرير ليس تحت المراجعة." });
   const c = clampInt(req.body && req.body.completeness, 0, 100, 85);
   const qy = clampInt(req.body && req.body.quality, 0, 100, 85);
@@ -151,6 +160,7 @@ app.post("/api/reports/:id/approve", requireAuth, requirePerm("review_reports"),
 app.post("/api/reports/:id/return", requireAuth, requirePerm("review_reports"), asyncH(async (req, res) => {
   const r = await D.getReportById(req.params.id);
   if (!r) return res.status(404).json({ error: "التقرير غير موجود." });
+  if (!(await D.canManage(req.user, r.employee_id))) return res.status(403).json({ error: "هذا التقرير ليس ضمن فريقك." });
   if (r.status !== "review") return res.status(400).json({ error: "لا يمكن إعادة تقرير ليس تحت المراجعة." });
   const reason = String((req.body && req.body.reason) || "").trim();
   if (!reason) return res.status(400).json({ error: "سبب الإعادة إلزامي." });
@@ -165,33 +175,40 @@ app.post("/api/reports/:id/return", requireAuth, requirePerm("review_reports"), 
 /* =========================================================
    TARGETS
    ========================================================= */
+// إضافة مستهدف واحد باسمه وتاريخه لموظف
 app.post("/api/targets", requireAuth, requirePerm("assign_targets"), asyncH(async (req, res) => {
   const empId = String((req.body && req.body.employeeId) || "");
   const quarter = String((req.body && req.body.quarter) || D.CUR_Q);
-  const target = clampInt(req.body && req.body.target, 0, 30, 0);
+  const title = String((req.body && req.body.title) || "").trim();
+  const dueDate = String((req.body && req.body.dueDate) || "").trim() || D.dayShift(14);
   const emp = await D.getUserById(empId);
   if (!emp || emp.role !== "employee") return res.status(400).json({ error: "موظف غير صالح." });
   if (!D.QUARTERS.includes(quarter)) return res.status(400).json({ error: "ربع غير صالح." });
+  if (!title) return res.status(400).json({ error: "اسم المستهدف مطلوب." });
+  if (!(await D.canManage(req.user, empId))) return res.status(403).json({ error: "هذا الموظف ليس ضمن فريقك." });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: "تاريخ الاستحقاق غير صالح." });
 
-  await D.tx(async (q) => {
-    await q("INSERT INTO targets(id,employee_id,quarter,target) VALUES($1,$2,$3,0) ON CONFLICT(employee_id,quarter) DO NOTHING",
-      [D.uid("t"), empId, quarter]);
-    const existing = (await q("SELECT * FROM reports WHERE employee_id=$1 AND quarter=$2 ORDER BY slot_no", [empId, quarter])).rows;
-    if (target > existing.length) {
-      const pool = ["زيارة تقييمية", "تقرير متابعة", "تجربة مستفيد", "زيارة ميدانية", "تقرير جودة"];
-      for (let i = existing.length; i < target; i++) {
-        await q(`INSERT INTO reports(id,slot_no,employee_id,type_id,quarter,title,status,due_date,attachments)
-          VALUES($1,$2,$3,'mystery',$4,$5,'assigned',$6,'[]')`,
-          [D.uid("r"), i + 1, empId, quarter, pool[i % pool.length] + " #" + (i + 1), D.dayShift(10 + (i - existing.length) * 14)]);
-      }
-    } else if (target < existing.length) {
-      const removable = existing.filter(r => r.status === "assigned").reverse();
-      let toRemove = existing.length - target;
-      for (const r of removable) { if (toRemove <= 0) break; await q("DELETE FROM reports WHERE id=$1", [r.id]); toRemove--; }
-    }
-    await q("UPDATE targets SET target=$1 WHERE employee_id=$2 AND quarter=$3", [target, empId, quarter]);
-  });
-  await D.logActivity(req.user.id, `حدّد مستهدف ${emp.name} بـ ${target} تقارير (${quarter})`, "target");
+  const maxSlot = (await D.query("SELECT COALESCE(MAX(slot_no),0)::int AS m FROM reports WHERE employee_id=$1 AND quarter=$2", [empId, quarter])).rows[0].m;
+  await D.query(`INSERT INTO reports(id,slot_no,employee_id,type_id,quarter,title,status,due_date,attachments)
+    VALUES($1,$2,$3,'general',$4,$5,'assigned',$6,'[]')`,
+    [D.uid("r"), maxSlot + 1, empId, quarter, title, dueDate]);
+  await D.syncTargetCount(empId, quarter);
+  await D.logActivity(req.user.id, `أسند مستهدف «${title}» لـ${emp.name} (${quarter})`, "target");
+  res.json({ ok: true });
+}));
+
+// حذف مستهدف مفرد (فقط إن لم يُرفع/يُعتمد بعد)
+app.post("/api/targets/:reportId/delete", requireAuth, requirePerm("assign_targets"), asyncH(async (req, res) => {
+  const r = await D.getReportById(req.params.reportId);
+  if (!r) return res.status(404).json({ error: "المستهدف غير موجود." });
+  if (!(await D.canManage(req.user, r.employee_id))) return res.status(403).json({ error: "هذا الموظف ليس ضمن فريقك." });
+  if (!(r.status === "assigned" || r.status === "returned"))
+    return res.status(400).json({ error: "لا يمكن حذف مستهدف تم رفعه أو اعتماده." });
+  await D.query("DELETE FROM report_history WHERE report_id=$1", [r.id]);
+  await D.query("DELETE FROM reports WHERE id=$1", [r.id]);
+  await D.syncTargetCount(r.employee_id, r.quarter);
+  const emp = await D.getUserById(r.employee_id);
+  await D.logActivity(req.user.id, `حذف مستهدف «${r.title}» من ${emp ? emp.name : ""}`, "target");
   res.json({ ok: true });
 }));
 
@@ -204,13 +221,14 @@ app.post("/api/users", requireAuth, requirePerm("manage_users"), asyncH(async (r
   if (!name || !username) return res.status(400).json({ error: "الاسم واسم المستخدم مطلوبان." });
   if (!/^[a-zA-Z0-9._-]{3,}$/.test(username)) return res.status(400).json({ error: "اسم المستخدم: أحرف لاتينية/أرقام، 3 على الأقل." });
   if (await D.getUserByUsername(username)) return res.status(400).json({ error: "اسم المستخدم مستخدم بالفعل." });
-  const role = ["admin", "manager", "employee"].includes(b.role) ? b.role : "employee";
+  const role = D.ROLES.includes(b.role) ? b.role : "employee";
   const pass = String(b.password || "").length >= 6 ? String(b.password) : "Welcome#2026";
   const extra = sanitizeExtra(b.extraPerms);
+  const supervisors = await sanitizeSupervisors(b.supervisors);
   const id = D.uid("u");
-  await D.query(`INSERT INTO users(id,name,username,password_hash,role,dept,title,active,extra_perms,created_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9)`,
-    [id, name, username, bcrypt.hashSync(pass, 10), role, String(b.dept || ""), String(b.title || ""), JSON.stringify(extra), D.iso(D.NOW)]);
+  await D.query(`INSERT INTO users(id,name,username,password_hash,role,dept,title,active,extra_perms,supervisors,created_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10)`,
+    [id, name, username, bcrypt.hashSync(pass, 10), role, String(b.dept || ""), String(b.title || ""), JSON.stringify(extra), JSON.stringify(supervisors), D.iso(D.NOW)]);
   await D.logActivity(req.user.id, `أنشأ حساب المستخدم «${name}»`, "user");
   res.json({ ok: true, id, tempPassword: b.password ? undefined : pass });
 }));
@@ -223,10 +241,11 @@ app.put("/api/users/:id", requireAuth, requirePerm("manage_users"), asyncH(async
   const username = String(b.username || u.username).trim();
   const dup = await D.getUserByUsername(username);
   if (dup && dup.id !== u.id) return res.status(400).json({ error: "اسم المستخدم مستخدم بالفعل." });
-  const role = ["admin", "manager", "employee"].includes(b.role) ? b.role : u.role;
+  const role = D.ROLES.includes(b.role) ? b.role : u.role;
   const extra = sanitizeExtra(b.extraPerms);
-  await D.query("UPDATE users SET name=$1, username=$2, role=$3, dept=$4, title=$5, extra_perms=$6 WHERE id=$7",
-    [name, username, role, String(b.dept || ""), String(b.title || ""), JSON.stringify(extra), u.id]);
+  const supervisors = await sanitizeSupervisors(b.supervisors);
+  await D.query("UPDATE users SET name=$1, username=$2, role=$3, dept=$4, title=$5, extra_perms=$6, supervisors=$7 WHERE id=$8",
+    [name, username, role, String(b.dept || ""), String(b.title || ""), JSON.stringify(extra), JSON.stringify(supervisors), u.id]);
   if (b.password && String(b.password).length >= 6)
     await D.query("UPDATE users SET password_hash=$1 WHERE id=$2", [bcrypt.hashSync(String(b.password), 10), u.id]);
   await D.logActivity(req.user.id, `عدّل حساب المستخدم «${name}»`, "user");
@@ -250,7 +269,7 @@ app.put("/api/permissions", requireAuth, requirePerm("manage_permissions"), asyn
   const role = String((req.body && req.body.role) || "");
   const perm = String((req.body && req.body.perm) || "");
   if (role === "admin") return res.status(400).json({ error: "لا يمكن تعديل صلاحيات مدير النظام." });
-  if (!["manager", "employee"].includes(role)) return res.status(400).json({ error: "دور غير صالح." });
+  if (!["general_manager", "manager", "employee"].includes(role)) return res.status(400).json({ error: "دور غير صالح." });
   if (!D.PERMS.includes(perm)) return res.status(400).json({ error: "صلاحية غير صالحة." });
   const rp = await D.getRolePerms();
   const arr = rp[role] || [];

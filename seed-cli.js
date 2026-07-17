@@ -12,6 +12,7 @@ const D = require("./db");
   const arg = process.argv[2];
   if (arg === "--reset") { await D.resetAll(); await D.seedBase(true); }
   else if (arg === "--demo") { await D.seedBase(false); await D.seedDemo(); }
+  else if (arg === "--clear-assignments") { await D.resetAssignments(); }
   else { await D.seedBase(false); }
   process.exit(0);
 })().catch(e => { console.error(e); process.exit(1); });

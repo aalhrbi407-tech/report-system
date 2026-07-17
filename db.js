@@ -16,9 +16,13 @@ const PERMS = [
 ];
 const DEFAULT_ROLE_PERMS = {
   admin: PERMS.slice(),
-  manager: ["assign_targets", "review_reports", "view_all_reports", "view_statistics", "view_activity", "submit_reports"],
+  general_manager: ["assign_targets", "review_reports", "view_all_reports", "view_statistics", "view_activity"],
+  manager: ["assign_targets", "review_reports", "view_all_reports", "view_statistics", "view_activity"],
   employee: ["submit_reports"]
 };
+const ROLES = ["admin", "general_manager", "manager", "employee"];
+// من يرى كل الفرق دون تقييد بربط:
+function roleSeesAll(role) { return role === "admin" || role === "general_manager"; }
 const QUARTERS = ["2026-Q1", "2026-Q2", "2026-Q3"];
 const CUR_Q = "2026-Q3";
 
@@ -93,8 +97,11 @@ async function migrate() {
       title TEXT,
       active INTEGER NOT NULL DEFAULT 1,
       extra_perms TEXT NOT NULL DEFAULT '[]',
+      supervisors TEXT NOT NULL DEFAULT '[]',
       created_at TEXT
     )`);
+  // ترقية قواعد البيانات القائمة:
+  await X.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS supervisors TEXT NOT NULL DEFAULT '[]'`);
   await X.query(`
     CREATE TABLE IF NOT EXISTS targets(
       id TEXT PRIMARY KEY,
@@ -166,7 +173,7 @@ async function getRolePerms() {
   const { rows } = await X.query("SELECT role,perms FROM role_perms");
   const out = {};
   rows.forEach(r => out[r.role] = JSON.parse(r.perms));
-  ["admin", "manager", "employee"].forEach(r => { if (!out[r]) out[r] = DEFAULT_ROLE_PERMS[r].slice(); });
+  ROLES.forEach(r => { if (!out[r]) out[r] = DEFAULT_ROLE_PERMS[r].slice(); });
   out.admin = PERMS.slice();
   return out;
 }
@@ -182,7 +189,8 @@ async function setRolePerm(role, perms) {
 function mapUser(r, includeHash) {
   if (!r) return null;
   const u = { id: r.id, name: r.name, username: r.username, role: r.role, dept: r.dept, title: r.title,
-    active: !!r.active, extraPerms: JSON.parse(r.extra_perms || "[]") };
+    active: !!r.active, extraPerms: JSON.parse(r.extra_perms || "[]"),
+    supervisors: JSON.parse(r.supervisors || "[]") };
   if (includeHash) u.password_hash = r.password_hash;
   return u;
 }
@@ -221,37 +229,73 @@ async function logActivity(actor, action, type) {
   await X.query("INSERT INTO activity(ts,actor,action,type) VALUES($1,$2,$3,$4)", [iso(NOW), actor, action, type || "info"]);
 }
 
+/* ---------- team scoping ---------- */
+// أسماء الموظفين الذين يراهم هذا المستخدم:
+//   admin / general_manager -> كل الموظفين
+//   manager -> الموظفون المرتبطون به فقط
+//   employee -> نفسه فقط
+async function managedEmployeeIds(userRow) {
+  const emps = (await X.query("SELECT id, role, supervisors FROM users WHERE role='employee'")).rows;
+  if (roleSeesAll(userRow.role)) return emps.map(e => e.id);
+  if (userRow.role === "manager")
+    return emps.filter(e => JSON.parse(e.supervisors || "[]").includes(userRow.id)).map(e => e.id);
+  return [userRow.id];
+}
+// هل يحق لهذا المستخدم التصرّف على تقارير/مستهدفات هذا الموظف؟
+async function canManage(userRow, employeeId) {
+  if (roleSeesAll(userRow.role)) return true;
+  if (userRow.role !== "manager") return false;
+  const emp = await getUserById(employeeId);
+  if (!emp) return false;
+  return JSON.parse(emp.supervisors || "[]").includes(userRow.id);
+}
+
 /* =========================================================
    BOOTSTRAP (permission-scoped snapshot)
    ========================================================= */
 async function bootstrap(userRow) {
   const perms = await effectivePerms(userRow);
-  const canViewAll = perms.includes("view_all_reports");
-  const canUsers = perms.includes("manage_users") || perms.includes("assign_targets") || perms.includes("view_statistics");
+  const seesAll = roleSeesAll(userRow.role);
+  const isManager = userRow.role === "manager";
   const canActivity = perms.includes("view_activity");
+  const allUsers = (await X.query("SELECT * FROM users")).rows;
 
-  let users;
-  if (canViewAll || canUsers) users = (await X.query("SELECT * FROM users")).rows.map(u => mapUser(u));
-  else users = [mapUser(userRow)];
+  let users, empScope;
+  if (seesAll) {
+    users = allUsers.map(u => mapUser(u));
+    empScope = null; // كل الموظفين
+  } else if (isManager) {
+    const managed = await managedEmployeeIds(userRow); // ids الموظفين المرتبطين
+    const set = new Set(managed);
+    // يرى نفسه + المشرفين المشاركين + موظفيه (حتى تظهر الأسماء في الواجهة)
+    users = allUsers.filter(u => u.id === userRow.id || set.has(u.id) || u.role === "manager" || u.role === "general_manager").map(u => mapUser(u));
+    empScope = set;
+  } else {
+    users = [mapUser(userRow)];
+    empScope = new Set([userRow.id]);
+  }
 
-  const repRows = canViewAll
-    ? (await X.query("SELECT * FROM reports")).rows
-    : (await X.query("SELECT * FROM reports WHERE employee_id=$1", [userRow.id])).rows;
+  const inScope = r => empScope === null ? true : empScope.has(r.employee_id);
+  const allReports = (await X.query("SELECT * FROM reports")).rows.filter(inScope);
   const reports = [];
-  for (const r of repRows) reports.push(await mapReport(r));
+  for (const r of allReports) reports.push(await mapReport(r));
 
-  const targets = canViewAll
-    ? (await X.query("SELECT * FROM targets")).rows.map(mapTarget)
-    : (await X.query("SELECT * FROM targets WHERE employee_id=$1", [userRow.id])).rows.map(mapTarget);
+  const targets = (await X.query("SELECT * FROM targets")).rows.filter(inScope).map(mapTarget);
 
-  const activity = canActivity
-    ? (await X.query("SELECT * FROM activity ORDER BY id DESC LIMIT 200")).rows.map(mapActivity)
-    : [];
+  let activity = [];
+  if (canActivity) {
+    const rows = (await X.query("SELECT * FROM activity ORDER BY id DESC LIMIT 200")).rows;
+    if (seesAll) activity = rows.map(mapActivity);
+    else {
+      const actors = new Set([userRow.id, ...(empScope ? [...empScope] : [])]);
+      activity = rows.filter(a => actors.has(a.actor)).map(mapActivity);
+    }
+  }
 
   const meObj = mapUser(userRow); meObj.perms = perms;
   return {
     session: userRow.id, me: meObj, users, reports, targets, activity,
-    rolePerms: await getRolePerms(), reportTypes: await getReportTypes(), settings: await getSettings(),
+    rolePerms: await getRolePerms(), settings: await getSettings(),
     quarters: QUARTERS, currentQuarter: CUR_Q, permsCatalog: PERMS
   };
 }
@@ -291,11 +335,14 @@ async function seedDemo() {
     X.query(`INSERT INTO users(id,name,username,password_hash,role,dept,title,active,extra_perms,created_at)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,'[]',$9) ON CONFLICT(id) DO NOTHING`,
       [id, name, username, H("pass123"), role, dept, title, active ? 1 : 0, iso(NOW)]);
+  await U("u_gm", "بدر العنزي", "gm", "general_manager", "الإدارة العليا", "مدير عام", 1);
   await U("u_sara", "سارة الشهري", "sara", "manager", "إدارة الجودة وتجربة المستفيد", "مشرفة برنامج الزائر السري", 1);
   await U("u_ahmed", "أحمد محمد", "ahmed", "employee", "فريق الزائر السري", "مقيّم تجربة المستفيد", 1);
   await U("u_khaled", "خالد العتيبي", "khaled", "employee", "فريق الزائر السري", "مقيّم ميداني", 1);
   await U("u_noura", "نورة القحطاني", "noura", "employee", "فريق الزائر السري", "مقيّمة تجربة المستفيد", 1);
   await U("u_maha", "مها السالم", "maha", "employee", "فريق الزائر السري", "مقيّمة تجربة المستفيد", 1);
+  // ربط الموظفين بالمشرفة سارة (نموذج تجريبي)
+  await X.query("UPDATE users SET supervisors='[\"u_sara\"]' WHERE id IN ('u_ahmed','u_khaled','u_noura','u_maha')");
 
   const T = (emp, quarter, target) =>
     X.query("INSERT INTO targets(id,employee_id,quarter,target) VALUES($1,$2,$3,$4) ON CONFLICT(employee_id,quarter) DO NOTHING",
@@ -340,6 +387,25 @@ async function seedDemo() {
   console.log("✅ تم تحميل بيانات الفريق التجريبي (كلمات المرور: pass123، المشرفة: sara).");
 }
 
+// يجعل عدّاد المستهدف = عدد التقارير المُسندة للموظف في هذا الربع
+async function syncTargetCount(empId, quarter) {
+  const c = (await X.query("SELECT COUNT(*)::int AS c FROM reports WHERE employee_id=$1 AND quarter=$2", [empId, quarter])).rows[0].c;
+  if (c === 0) { await X.query("DELETE FROM targets WHERE employee_id=$1 AND quarter=$2", [empId, quarter]); return 0; }
+  await X.query(
+    `INSERT INTO targets(id,employee_id,quarter,target) VALUES($1,$2,$3,$4)
+     ON CONFLICT(employee_id,quarter) DO UPDATE SET target=EXCLUDED.target`,
+    [uid("t"), empId, quarter, c]);
+  return c;
+}
+
+// يمسح المستهدفات والتقارير فقط (تُبقي المستخدمين والإعدادات)
+async function resetAssignments() {
+  await X.query("DELETE FROM report_history");
+  await X.query("DELETE FROM reports");
+  await X.query("DELETE FROM targets");
+  console.log("🗑️  تم مسح جميع المستهدفات والتقارير (المستخدمون والإعدادات محفوظون).");
+}
+
 async function resetAll() {
   await X.query("DELETE FROM report_history"); await X.query("DELETE FROM reports");
   await X.query("DELETE FROM targets"); await X.query("DELETE FROM activity");
@@ -349,9 +415,11 @@ async function resetAll() {
 
 module.exports = {
   init, backend,
-  PERMS, QUARTERS, CUR_Q, DEFAULT_ROLE_PERMS, uid, iso, dayShift, NOW,
+  PERMS, QUARTERS, CUR_Q, ROLES, DEFAULT_ROLE_PERMS, roleSeesAll, uid, iso, dayShift, NOW,
   query: (s, p) => X.query(s, p), tx: (fn) => X.tx(fn),
   getUserById, getUserByUsername, getReportById, effectivePerms, logActivity,
+  managedEmployeeIds, canManage,
   getSettings, setSetting, getReportTypes, getRolePerms, setRolePerm,
-  mapUser, mapReport, mapTarget, bootstrap, seedBase, seedDemo, resetAll
+  mapUser, mapReport, mapTarget, bootstrap, seedBase, seedDemo, resetAll,
+  syncTargetCount, resetAssignments
 };
