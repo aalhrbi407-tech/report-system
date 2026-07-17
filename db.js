@@ -125,8 +125,12 @@ async function migrate() {
       m_completeness INTEGER,
       m_quality INTEGER,
       return_reason TEXT,
+      submit_note TEXT,
+      review_note TEXT,
       attachments TEXT NOT NULL DEFAULT '[]'
     )`);
+  await X.query(`ALTER TABLE reports ADD COLUMN IF NOT EXISTS submit_note TEXT`);
+  await X.query(`ALTER TABLE reports ADD COLUMN IF NOT EXISTS review_note TEXT`);
   await X.query(`
     CREATE TABLE IF NOT EXISTS report_history(
       id BIGSERIAL PRIMARY KEY,
@@ -162,6 +166,27 @@ const DEFAULT_TYPES = [
   { id: "deep", n: "تقرير معمّق", w: 1.5 }
 ];
 async function getReportTypes() { return getSetting("reportTypes", DEFAULT_TYPES); }
+const DEFAULT_BRANDING = {
+  orgName: "إدارة الجودة وتجربة المستفيد",
+  program: "برنامج الزائر السري",
+  loginTitle1: "آلية مؤتمتة",
+  loginTitle2: "لمتابعة وتقييم التقارير",
+  loginIntro: "يبدأ كل موظف الربع برصيد تقارير مستهدف، وينخفض الرصيد تلقائيًا مع كل تسليم معتمد — مع قياس الالتزام الزمني والجودة في لوحة واحدة.",
+  loginPoints: ["ربط التكليف بالتسليم", "خصم آلي بعد الاعتماد", "تقييم موزون للجودة والالتزام", "صلاحيات ومستخدمون قابلون للإدارة"],
+  loginFooter: "© 2026 — نظام متابعة التقارير المؤتمت"
+};
+async function getBranding() {
+  const orgName = await getSetting("orgName", DEFAULT_BRANDING.orgName);
+  const program = await getSetting("program", DEFAULT_BRANDING.program);
+  return {
+    orgName, program,
+    loginTitle1: await getSetting("loginTitle1", DEFAULT_BRANDING.loginTitle1),
+    loginTitle2: await getSetting("loginTitle2", DEFAULT_BRANDING.loginTitle2),
+    loginIntro: await getSetting("loginIntro", DEFAULT_BRANDING.loginIntro),
+    loginPoints: await getSetting("loginPoints", DEFAULT_BRANDING.loginPoints),
+    loginFooter: await getSetting("loginFooter", DEFAULT_BRANDING.loginFooter)
+  };
+}
 async function getSettings() {
   return {
     weights: await getSetting("weights", { timeliness: 30, completeness: 25, quality: 30, closure: 15 }),
@@ -202,6 +227,7 @@ async function mapReport(r) {
     id: r.id, slotNo: r.slot_no, employeeId: r.employee_id, typeId: r.type_id, quarter: r.quarter,
     title: r.title, status: r.status, dueDate: r.due_date, uploadDate: r.upload_date, weight: r.weight,
     mCompleteness: r.m_completeness, mQuality: r.m_quality, returnReason: r.return_reason,
+    submitNote: r.submit_note || "", reviewNote: r.review_note || "",
     attachments: JSON.parse(r.attachments || "[]"),
     history: rows.map(h => ({ ts: h.ts, actor: h.actor, action: h.action, note: h.note || "" }))
   };
@@ -295,7 +321,7 @@ async function bootstrap(userRow) {
   const meObj = mapUser(userRow); meObj.perms = perms;
   return {
     session: userRow.id, me: meObj, users, reports, targets, activity,
-    rolePerms: await getRolePerms(), settings: await getSettings(),
+    rolePerms: await getRolePerms(), settings: await getSettings(), branding: await getBranding(),
     quarters: QUARTERS, currentQuarter: CUR_Q, permsCatalog: PERMS
   };
 }
@@ -420,6 +446,7 @@ module.exports = {
   getUserById, getUserByUsername, getReportById, effectivePerms, logActivity,
   managedEmployeeIds, canManage,
   getSettings, setSetting, getReportTypes, getRolePerms, setRolePerm,
+  getBranding, DEFAULT_BRANDING,
   mapUser, mapReport, mapTarget, bootstrap, seedBase, seedDemo, resetAll,
   syncTargetCount, resetAssignments
 };

@@ -113,6 +113,11 @@ app.get("/api/bootstrap", requireAuth, asyncH(async (req, res) => {
   res.json(await D.bootstrap(req.user));
 }));
 
+// نصوص صفحة الدخول (عامّة، بلا مصادقة)
+app.get("/api/branding", asyncH(async (req, res) => {
+  res.json(await D.getBranding());
+}));
+
 app.post("/api/me/password", requireAuth, asyncH(async (req, res) => {
   const { current, next: newPass } = req.body || {};
   if (!newPass || String(newPass).length < 6) return res.status(400).json({ error: "كلمة المرور الجديدة يجب ألا تقل عن 6 أحرف." });
@@ -133,8 +138,9 @@ app.post("/api/reports/:id/submit", requireAuth, requirePerm("submit_reports"), 
   if (!(r.status === "assigned" || r.status === "returned"))
     return res.status(400).json({ error: "لا يمكن رفع هذا التقرير في حالته الحالية." });
   const atts = Array.isArray(req.body && req.body.attachments) ? req.body.attachments.slice(0, 20) : JSON.parse(r.attachments || "[]");
-  await D.query("UPDATE reports SET status='review', upload_date=$1, attachments=$2 WHERE id=$3",
-    [D.iso(D.NOW), JSON.stringify(atts), r.id]);
+  const note = String((req.body && req.body.note) || "").slice(0, 2000);
+  await D.query("UPDATE reports SET status='review', upload_date=$1, attachments=$2, submit_note=$3 WHERE id=$4",
+    [D.iso(D.NOW), JSON.stringify(atts), note, r.id]);
   await D.query("INSERT INTO report_history(report_id,ts,actor,action,note) VALUES($1,$2,$3,'submitted','')",
     [r.id, D.iso(D.NOW), req.user.id]);
   await D.logActivity(req.user.id, `رفع تقرير «${r.title}» للمراجعة`, "submit");
@@ -148,8 +154,9 @@ app.post("/api/reports/:id/approve", requireAuth, requirePerm("review_reports"),
   if (r.status !== "review") return res.status(400).json({ error: "لا يمكن اعتماد تقرير ليس تحت المراجعة." });
   const c = clampInt(req.body && req.body.completeness, 0, 100, 85);
   const qy = clampInt(req.body && req.body.quality, 0, 100, 85);
-  await D.query("UPDATE reports SET status='approved', m_completeness=$1, m_quality=$2, return_reason=NULL WHERE id=$3",
-    [c, qy, r.id]);
+  const note = String((req.body && req.body.note) || "").slice(0, 2000);
+  await D.query("UPDATE reports SET status='approved', m_completeness=$1, m_quality=$2, return_reason=NULL, review_note=$3 WHERE id=$4",
+    [c, qy, note, r.id]);
   await D.query("INSERT INTO report_history(report_id,ts,actor,action,note) VALUES($1,$2,$3,'approved','')",
     [r.id, D.iso(D.NOW), req.user.id]);
   const emp = await D.getUserById(r.employee_id);
@@ -299,6 +306,30 @@ app.put("/api/settings/org", requireAuth, requirePerm("manage_settings"), asyncH
   if (b.orgName) await D.setSetting("orgName", String(b.orgName).slice(0, 120));
   if (b.program) await D.setSetting("program", String(b.program).slice(0, 120));
   await D.logActivity(req.user.id, "حدّث هوية النظام", "settings");
+  res.json({ ok: true });
+}));
+
+// نصوص صفحة الدخول
+app.put("/api/settings/branding", requireAuth, requirePerm("manage_settings"), asyncH(async (req, res) => {
+  const b = req.body || {};
+  const str = (v, n) => String(v == null ? "" : v).slice(0, n);
+  if (b.orgName != null) await D.setSetting("orgName", str(b.orgName, 120));
+  if (b.program != null) await D.setSetting("program", str(b.program, 120));
+  if (b.loginTitle1 != null) await D.setSetting("loginTitle1", str(b.loginTitle1, 120));
+  if (b.loginTitle2 != null) await D.setSetting("loginTitle2", str(b.loginTitle2, 120));
+  if (b.loginIntro != null) await D.setSetting("loginIntro", str(b.loginIntro, 600));
+  if (Array.isArray(b.loginPoints)) await D.setSetting("loginPoints", b.loginPoints.slice(0, 6).map(x => str(x, 100)).filter(Boolean));
+  if (b.loginFooter != null) await D.setSetting("loginFooter", str(b.loginFooter, 160));
+  await D.logActivity(req.user.id, "حدّث نصوص صفحة الدخول", "settings");
+  res.json({ ok: true });
+}));
+
+// حذف جميع بيانات التقارير والمستهدفات (يُبقي المستخدمين والإعدادات)
+app.post("/api/data/reset-assignments", requireAuth, requirePerm("manage_settings"), asyncH(async (req, res) => {
+  if (!(req.body && req.body.confirm === "DELETE"))
+    return res.status(400).json({ error: "التأكيد مطلوب." });
+  await D.resetAssignments();
+  await D.logActivity(req.user.id, "مسح جميع بيانات التقارير والمستهدفات", "settings");
   res.json({ ok: true });
 }));
 
