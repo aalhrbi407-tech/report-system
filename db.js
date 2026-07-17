@@ -23,8 +23,11 @@ const DEFAULT_ROLE_PERMS = {
 const ROLES = ["admin", "general_manager", "manager", "employee"];
 // من يرى كل الفرق دون تقييد بربط:
 function roleSeesAll(role) { return role === "admin" || role === "general_manager"; }
-const QUARTERS = ["2026-Q1", "2026-Q2", "2026-Q3"];
-const CUR_Q = "2026-Q3";
+const _now = new Date();
+const _year = _now.getFullYear();
+const _qn = Math.floor(_now.getMonth() / 3) + 1;   // 1..4 حسب الشهر الحالي
+const CUR_Q = _year + "-Q" + _qn;                   // الربع الحالي تلقائيًا
+const QUARTERS = [_year + "-Q1", _year + "-Q2", _year + "-Q3", _year + "-Q4"];
 
 /* ---------- date helpers ---------- */
 const NOW = new Date();
@@ -319,10 +322,15 @@ async function bootstrap(userRow) {
   }
 
   const meObj = mapUser(userRow); meObj.perms = perms;
+  // قائمة الأرباع = أرباع السنة الحالية + أي ربع فيه بيانات (لحفظ التاريخ)
+  const qset = new Set(QUARTERS);
+  reports.forEach(r => qset.add(r.quarter));
+  targets.forEach(t => qset.add(t.quarter));
+  const quarterList = Array.from(qset).sort();
   return {
     session: userRow.id, me: meObj, users, reports, targets, activity,
     rolePerms: await getRolePerms(), settings: await getSettings(), branding: await getBranding(),
-    quarters: QUARTERS, currentQuarter: CUR_Q, permsCatalog: PERMS
+    quarters: quarterList, currentQuarter: CUR_Q, permsCatalog: PERMS
   };
 }
 

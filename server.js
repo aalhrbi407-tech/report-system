@@ -190,7 +190,7 @@ app.post("/api/targets", requireAuth, requirePerm("assign_targets"), asyncH(asyn
   const dueDate = String((req.body && req.body.dueDate) || "").trim() || D.dayShift(14);
   const emp = await D.getUserById(empId);
   if (!emp || emp.role !== "employee") return res.status(400).json({ error: "موظف غير صالح." });
-  if (!D.QUARTERS.includes(quarter)) return res.status(400).json({ error: "ربع غير صالح." });
+  if (!/^\d{4}-Q[1-4]$/.test(quarter)) return res.status(400).json({ error: "ربع غير صالح." });
   if (!title) return res.status(400).json({ error: "اسم المستهدف مطلوب." });
   if (!(await D.canManage(req.user, empId))) return res.status(403).json({ error: "هذا الموظف ليس ضمن فريقك." });
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: "تاريخ الاستحقاق غير صالح." });
