@@ -313,6 +313,19 @@ app.put("/api/settings/org", requireAuth, requirePerm("manage_settings"), asyncH
 app.put("/api/settings/branding", requireAuth, requirePerm("manage_settings"), asyncH(async (req, res) => {
   const b = req.body || {};
   const str = (v, n) => String(v == null ? "" : v).slice(0, n);
+  if (b.systemName != null) await D.setSetting("systemName", str(b.systemName, 80) || "نظام تكليف");
+  if (b.logo != null) {
+    const logo = String(b.logo || "");
+    if (logo === "") {
+      await D.setSetting("logo", "");                       // إزالة الشعار
+    } else {
+      if (!/^data:image\/(png|jpeg|jpg|svg\+xml|webp|gif);base64,/.test(logo))
+        return res.status(400).json({ error: "صيغة الشعار غير مدعومة (استخدم PNG أو SVG أو JPG)." });
+      if (logo.length > 700000)
+        return res.status(400).json({ error: "حجم الشعار كبير — استخدم صورة أصغر من 500 كيلوبايت." });
+      await D.setSetting("logo", logo);
+    }
+  }
   if (b.orgName != null) await D.setSetting("orgName", str(b.orgName, 120));
   if (b.program != null) await D.setSetting("program", str(b.program, 120));
   if (b.loginTitle1 != null) await D.setSetting("loginTitle1", str(b.loginTitle1, 120));

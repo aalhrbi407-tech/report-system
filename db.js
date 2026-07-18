@@ -170,6 +170,8 @@ const DEFAULT_TYPES = [
 ];
 async function getReportTypes() { return getSetting("reportTypes", DEFAULT_TYPES); }
 const DEFAULT_BRANDING = {
+  systemName: "نظام تكليف",
+  logo: "",
   orgName: "إدارة الجودة وتجربة المستفيد",
   program: "برنامج الزائر السري",
   loginTitle1: "آلية مؤتمتة",
@@ -183,6 +185,8 @@ async function getBranding() {
   const program = await getSetting("program", DEFAULT_BRANDING.program);
   return {
     orgName, program,
+    systemName: await getSetting("systemName", DEFAULT_BRANDING.systemName),
+    logo: await getSetting("logo", DEFAULT_BRANDING.logo),
     loginTitle1: await getSetting("loginTitle1", DEFAULT_BRANDING.loginTitle1),
     loginTitle2: await getSetting("loginTitle2", DEFAULT_BRANDING.loginTitle2),
     loginIntro: await getSetting("loginIntro", DEFAULT_BRANDING.loginIntro),
