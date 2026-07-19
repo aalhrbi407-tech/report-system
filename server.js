@@ -396,9 +396,8 @@ app.get("/api/export/xlsx", requireAuth, requirePerm("view_statistics"), asyncH(
     return ids.map(id => byId[id] ? byId[id].name : "").filter(Boolean).join("، ") || "—";
   };
 
-  // ورقة 1: ملخّص الموظفين
-  const sum = [["الموظف", "الإدارة", "المشرف", "المستهدف", "معتمدة", "متبقّي", "نسبة الإنجاز %", "متوسط الدرجة %", "متأخرة", "الأداء العام %"]];
-  emps.forEach(e => {
+  // ورقة 1: ملخّص الموظفين — مرتّبة حسب الأداء العام (الأعلى أولًا)
+  const stats = emps.map(e => {
     const mine = reps.filter(r => r.employee_id === e.id);
     const t = (tgts.find(x => x.employee_id === e.id) || {}).target || 0;
     const appr = mine.filter(r => r.status === "approved");
@@ -406,12 +405,19 @@ app.get("/api/export/xlsx", requireAuth, requirePerm("view_statistics"), asyncH(
     const pct = t ? Math.round(appr.length / t * 100) : 0;
     const scores = appr.map(r => scoreReport(r, histBy[r.id], w)).filter(x => x != null);
     const avg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
-    sum.push([e.name, e.dept || "—", supNames(e), t, appr.length, Math.max(0, t - appr.length), pct, avg || "—", late, Math.round(pct * (avg || 0) / 100)]);
+    return { e, t, appr: appr.length, late, pct, avg, perf: Math.round(pct * avg / 100) };
+  }).sort((a, b) => b.perf - a.perf || b.pct - a.pct);
+
+  const sum = [["#", "الموظف", "الإدارة", "المشرف", "المستهدف", "معتمدة", "متبقّي", "نسبة الإنجاز %", "متوسط الدرجة %", "متأخرة", "الأداء العام %"]];
+  stats.forEach((s, i) => {
+    sum.push([i + 1, s.e.name, s.e.dept || "—", supNames(s.e), s.t, s.appr,
+      Math.max(0, s.t - s.appr), s.pct, s.avg || "—", s.late, s.perf]);
   });
 
-  // ورقة 2: تفاصيل المهام
+  // ورقة 2: تفاصيل المهام — بنفس ترتيب الأداء
+  const order = {}; stats.forEach((s, i) => order[s.e.id] = i);
   const det = [["الموظف", "اسم المهمة", "الحالة", "تاريخ الاستحقاق", "تاريخ التسليم", "الاكتمال %", "الجودة %", "الدرجة %", "متأخرة", "ملاحظة الموظف", "ملاحظة المشرف"]];
-  reps.sort((a, b) => (byId[a.employee_id] ? byId[a.employee_id].name : "").localeCompare(byId[b.employee_id] ? byId[b.employee_id].name : "", "ar") || a.slot_no - b.slot_no);
+  reps.sort((a, b) => (order[a.employee_id] ?? 999) - (order[b.employee_id] ?? 999) || a.slot_no - b.slot_no);
   reps.forEach(r => {
     const e = byId[r.employee_id]; if (!e) return;
     const sc = scoreReport(r, histBy[r.id], w);
@@ -423,7 +429,7 @@ app.get("/api/export/xlsx", requireAuth, requirePerm("view_statistics"), asyncH(
 
   const wb = XLSX.utils.book_new();
   const ws1 = XLSX.utils.aoa_to_sheet(sum);
-  ws1["!cols"] = [{ wch: 22 }, { wch: 20 }, { wch: 20 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 15 }, { wch: 9 }, { wch: 14 }];
+  ws1["!cols"] = [{ wch: 5 }, { wch: 22 }, { wch: 20 }, { wch: 20 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 15 }, { wch: 9 }, { wch: 14 }];
   const ws2 = XLSX.utils.aoa_to_sheet(det);
   ws2["!cols"] = [{ wch: 22 }, { wch: 30 }, { wch: 13 }, { wch: 14 }, { wch: 14 }, { wch: 11 }, { wch: 10 }, { wch: 10 }, { wch: 9 }, { wch: 30 }, { wch: 30 }];
   XLSX.utils.book_append_sheet(wb, ws1, "ملخص الموظفين");
