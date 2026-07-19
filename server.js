@@ -555,6 +555,78 @@ app.get("/api/export/xlsx", requireAuth, requirePerm("view_statistics"), asyncH(
 }));
 
 /* =========================================================
+   PWA — بيان التطبيق، الأيقونة، وعامل الخدمة
+   ========================================================= */
+// أيقونة افتراضية (شعار بسيط بألوان النظام) تُستخدم إن لم يُرفع شعار
+const FALLBACK_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<rect width="512" height="512" rx="112" fill="#16324F"/>
+<circle cx="256" cy="256" r="132" fill="none" stroke="#1E4B65" stroke-width="40"/>
+<circle cx="256" cy="256" r="132" fill="none" stroke="#8FE3D6" stroke-width="40"
+  stroke-linecap="round" stroke-dasharray="829" stroke-dashoffset="290" transform="rotate(-90 256 256)"/>
+<path d="M196 258l40 42 84-88" fill="none" stroke="#8FE3D6" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
+app.get("/manifest.webmanifest", asyncH(async (req, res) => {
+  const b = await D.getBranding();
+  const name = b.systemName || "نظام تكليف";
+  res.setHeader("Content-Type", "application/manifest+json; charset=utf-8");
+  res.json({
+    name, short_name: name.replace(/^نظام\s*/, "").slice(0, 12) || name,
+    description: "متابعة وتقييم التزام الموظفين بالمهام",
+    start_url: "/", scope: "/", display: "standalone", orientation: "any",
+    background_color: "#16324F", theme_color: "#16324F", dir: "rtl", lang: "ar",
+    icons: [
+      { src: "/app-icon.png", sizes: "192x192", type: "image/png", purpose: "any" },
+      { src: "/app-icon.png", sizes: "512x512", type: "image/png", purpose: "any" },
+      { src: "/app-icon.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
+    ]
+  });
+}));
+
+// أيقونة التطبيق: الشعار المرفوع إن وُجد، وإلا الأيقونة الافتراضية
+app.get("/app-icon.png", asyncH(async (req, res) => {
+  const b = await D.getBranding();
+  const logo = b.logo || "";
+  const m = logo.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+  if (m) {
+    res.setHeader("Content-Type", m[1]);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    return res.send(Buffer.from(m[2], "base64"));
+  }
+  res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(FALLBACK_ICON_SVG);
+}));
+
+// عامل الخدمة — يجعل التطبيق قابلًا للتثبيت ويعرض رسالة عند انقطاع الشبكة
+const SW_JS = `/* Taklif service worker */
+const CACHE = "taklif-shell-v1";
+self.addEventListener("install", e => { self.skipWaiting(); });
+self.addEventListener("activate", e => {
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
+});
+self.addEventListener("fetch", e => {
+  const req = e.request;
+  if (req.method !== "GET") return;                       // لا نتدخّل في الإرسال
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/api/")) return;           // البيانات دائمًا من الشبكة
+  e.respondWith(
+    fetch(req).then(resp => {
+      const copy = resp.clone();
+      caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
+      return resp;
+    }).catch(() => caches.match(req).then(r => r || caches.match("/")))
+  );
+});`;
+app.get("/sw.js", (req, res) => {
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Service-Worker-Allowed", "/");
+  res.setHeader("Cache-Control", "no-cache");
+  res.send(SW_JS);
+});
+
+/* =========================================================
    STATIC HOSTING (frontend embedded — no external folder)
    ========================================================= */
 const HTML = require("./frontend");
