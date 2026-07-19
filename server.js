@@ -91,13 +91,65 @@ function requirePerm(perm) {
 /* =========================================================
    AUTH ROUTES
    ========================================================= */
+/* =========================================================
+   حدّ محاولات الدخول — حماية من تخمين كلمات المرور
+   ========================================================= */
+const LOGIN_MAX = 5;                  // عدد المحاولات المسموحة
+const LOGIN_WINDOW = 15 * 60 * 1000;  // نافذة الرصد: 15 دقيقة
+const LOGIN_LOCK = 15 * 60 * 1000;    // مدة الحظر: 15 دقيقة
+const loginAttempts = new Map();      // key -> { fails:[ts], lockedUntil }
+
+function attemptKey(req, username) {
+  const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "-";
+  return String(username || "").toLowerCase() + "|" + ip;
+}
+function loginStatus(key) {
+  const rec = loginAttempts.get(key);
+  if (!rec) return { locked: false };
+  const now = Date.now();
+  if (rec.lockedUntil && now < rec.lockedUntil)
+    return { locked: true, minutes: Math.ceil((rec.lockedUntil - now) / 60000) };
+  if (rec.lockedUntil && now >= rec.lockedUntil) { loginAttempts.delete(key); return { locked: false }; }
+  return { locked: false };
+}
+function recordFail(key) {
+  const now = Date.now();
+  const rec = loginAttempts.get(key) || { fails: [] };
+  rec.fails = rec.fails.filter(t => now - t < LOGIN_WINDOW);
+  rec.fails.push(now);
+  if (rec.fails.length >= LOGIN_MAX) { rec.lockedUntil = now + LOGIN_LOCK; rec.fails = []; }
+  loginAttempts.set(key, rec);
+  return rec.lockedUntil ? Math.ceil(LOGIN_LOCK / 60000) : (LOGIN_MAX - rec.fails.length);
+}
+function clearAttempts(key) { loginAttempts.delete(key); }
+// تنظيف دوري للذاكرة
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of loginAttempts) {
+    const stale = (!v.lockedUntil || now > v.lockedUntil) && (!v.fails.length || now - v.fails[v.fails.length - 1] > LOGIN_WINDOW);
+    if (stale) loginAttempts.delete(k);
+  }
+}, 10 * 60 * 1000).unref();
+
 app.post("/api/login", asyncH(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: "أدخل اسم المستخدم وكلمة المرور." });
+  const key = attemptKey(req, username);
+  const st = loginStatus(key);
+  if (st.locked)
+    return res.status(429).json({ error: `تم إيقاف المحاولات مؤقتًا بسبب تكرار الفشل. حاول بعد ${st.minutes} دقيقة.` });
+
   const u = await D.getUserByUsername(String(username).trim());
   const ok = u && bcrypt.compareSync(String(password), u.password_hash);
-  if (!ok) return res.status(401).json({ error: "اسم المستخدم أو كلمة المرور غير صحيحة." });
+  if (!ok) {
+    const left = recordFail(key);
+    const rec = loginAttempts.get(key);
+    if (rec && rec.lockedUntil)
+      return res.status(429).json({ error: `تجاوزت عدد المحاولات المسموح. حاول بعد ${left} دقيقة.` });
+    return res.status(401).json({ error: `اسم المستخدم أو كلمة المرور غير صحيحة. المحاولات المتبقية: ${left}.` });
+  }
   if (!u.active) return res.status(403).json({ error: "هذا الحساب معطّل. راجع مدير النظام." });
+  clearAttempts(key);
   await D.logActivity(u.id, "سجّل الدخول إلى النظام", "auth");
   issueCookie(res, u.id);
   res.json({ ok: true });
@@ -202,6 +254,66 @@ app.post("/api/targets", requireAuth, requirePerm("assign_targets"), asyncH(asyn
   await D.syncTargetCount(empId, quarter);
   await D.logActivity(req.user.id, `أسند مستهدف «${title}» لـ${emp.name} (${quarter})`, "target");
   res.json({ ok: true });
+}));
+
+// إسناد مهمة واحدة لعدة موظفين دفعة واحدة
+app.post("/api/targets/bulk", requireAuth, requirePerm("assign_targets"), asyncH(async (req, res) => {
+  const b = req.body || {};
+  const ids = Array.isArray(b.employeeIds) ? b.employeeIds.filter(x => typeof x === "string") : [];
+  const quarter = String(b.quarter || D.CUR_Q);
+  const title = String(b.title || "").trim();
+  const dueDate = String(b.dueDate || "").trim() || D.dayShift(14);
+  if (!ids.length) return res.status(400).json({ error: "اختر موظفًا واحدًا على الأقل." });
+  if (!title) return res.status(400).json({ error: "اسم المستهدف مطلوب." });
+  if (!/^\d{4}-Q[1-4]$/.test(quarter)) return res.status(400).json({ error: "ربع غير صالح." });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: "تاريخ الاستحقاق غير صالح." });
+
+  let added = 0; const skipped = [];
+  for (const empId of ids) {
+    const emp = await D.getUserById(empId);
+    if (!emp || emp.role !== "employee" || !emp.active) { skipped.push(empId); continue; }
+    if (!(await D.canManage(req.user, empId))) { skipped.push(empId); continue; }
+    const maxSlot = (await D.query("SELECT COALESCE(MAX(slot_no),0)::int AS m FROM reports WHERE employee_id=$1 AND quarter=$2", [empId, quarter])).rows[0].m;
+    await D.query(`INSERT INTO reports(id,slot_no,employee_id,type_id,quarter,title,status,due_date,attachments)
+      VALUES($1,$2,$3,'general',$4,$5,'assigned',$6,'[]')`,
+      [D.uid("r"), maxSlot + 1, empId, quarter, title, dueDate]);
+    await D.syncTargetCount(empId, quarter);
+    added++;
+  }
+  if (!added) return res.status(403).json({ error: "لا يمكنك الإسناد لهؤلاء الموظفين." });
+  await D.logActivity(req.user.id, `أسند مستهدف «${title}» لـ${added} موظف (${quarter})`, "target");
+  res.json({ ok: true, added, skipped: skipped.length });
+}));
+
+// نسخ مستهدفات ربع سابق إلى ربع آخر
+app.post("/api/targets/copy", requireAuth, requirePerm("assign_targets"), asyncH(async (req, res) => {
+  const b = req.body || {};
+  const from = String(b.from || ""), to = String(b.to || D.CUR_Q);
+  const dueDate = String(b.dueDate || "").trim() || D.dayShift(30);
+  const exclude = Array.isArray(b.exclude) ? b.exclude : [];
+  if (!/^\d{4}-Q[1-4]$/.test(from) || !/^\d{4}-Q[1-4]$/.test(to))
+    return res.status(400).json({ error: "ربع غير صالح." });
+  if (from === to) return res.status(400).json({ error: "اختر ربعًا مختلفًا للنسخ منه." });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return res.status(400).json({ error: "تاريخ الاستحقاق غير صالح." });
+
+  const scope = await D.managedEmployeeIds(req.user);
+  const src = (await D.query("SELECT * FROM reports WHERE quarter=$1 ORDER BY employee_id, slot_no", [from])).rows
+    .filter(r => scope.includes(r.employee_id) && !exclude.includes(r.employee_id));
+  if (!src.length) return res.status(400).json({ error: "لا توجد مستهدفات في الربع المصدر ضمن نطاقك." });
+
+  let added = 0; const touched = new Set();
+  for (const r of src) {
+    const emp = await D.getUserById(r.employee_id);
+    if (!emp || !emp.active) continue;
+    const maxSlot = (await D.query("SELECT COALESCE(MAX(slot_no),0)::int AS m FROM reports WHERE employee_id=$1 AND quarter=$2", [r.employee_id, to])).rows[0].m;
+    await D.query(`INSERT INTO reports(id,slot_no,employee_id,type_id,quarter,title,status,due_date,attachments)
+      VALUES($1,$2,$3,'general',$4,$5,'assigned',$6,'[]')`,
+      [D.uid("r"), maxSlot + 1, r.employee_id, to, r.title, dueDate]);
+    touched.add(r.employee_id); added++;
+  }
+  for (const id of touched) await D.syncTargetCount(id, to);
+  await D.logActivity(req.user.id, `نسخ ${added} مستهدف من ${from} إلى ${to}`, "target");
+  res.json({ ok: true, added, employees: touched.size });
 }));
 
 // حذف مستهدف مفرد (فقط إن لم يُرفع/يُعتمد بعد)
