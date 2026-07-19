@@ -347,6 +347,96 @@ app.post("/api/data/reset-assignments", requireAuth, requirePerm("manage_setting
 }));
 
 /* =========================================================
+   EXPORT — تصدير التقارير إلى Excel
+   ========================================================= */
+function daysBetween(a, b) {
+  const d1 = new Date(a), d2 = new Date(b);
+  return Math.round((d2 - d1) / 86400000);
+}
+function timelinessScore(r) {
+  if (!r.upload_date) return 0;
+  const late = daysBetween(r.due_date, r.upload_date);
+  if (late <= 0) return 100;
+  return Math.max(0, 100 - late * 10);
+}
+function closureScore(hist) {
+  const returns = (hist || []).filter(h => h.action === "returned").length;
+  return Math.max(0, 100 - returns * 25);
+}
+function scoreReport(r, hist, w) {
+  if (r.status !== "approved") return null;
+  const t = timelinessScore(r);
+  const c = r.m_completeness != null ? r.m_completeness : 0;
+  const qy = r.m_quality != null ? r.m_quality : 0;
+  const cl = closureScore(hist);
+  return Math.round((t * w.timeliness + c * w.completeness + qy * w.quality + cl * w.closure) / 100);
+}
+const STATUS_AR = { assigned: "مسندة", review: "تحت المراجعة", approved: "معتمدة", returned: "معادة" };
+
+app.get("/api/export/xlsx", requireAuth, requirePerm("view_statistics"), asyncH(async (req, res) => {
+  const XLSX = require("xlsx");
+  const quarter = String(req.query.quarter || D.CUR_Q);
+  if (!/^\d{4}-Q[1-4]$/.test(quarter)) return res.status(400).json({ error: "ربع غير صالح." });
+
+  const settings = await D.getSettings();
+  const w = settings.weights;
+  const scopeIds = await D.managedEmployeeIds(req.user);      // نطاق صلاحية المستخدم
+  const allUsers = (await D.query("SELECT * FROM users")).rows;
+  const byId = {}; allUsers.forEach(u => byId[u.id] = u);
+  const emps = allUsers.filter(u => u.role === "employee" && scopeIds.includes(u.id) && u.active);
+
+  const reps = (await D.query("SELECT * FROM reports WHERE quarter=$1", [quarter])).rows
+    .filter(r => scopeIds.includes(r.employee_id));
+  const tgts = (await D.query("SELECT * FROM targets WHERE quarter=$1", [quarter])).rows;
+  const hists = (await D.query("SELECT * FROM report_history ORDER BY id ASC")).rows;
+  const histBy = {}; hists.forEach(h => (histBy[h.report_id] = histBy[h.report_id] || []).push(h));
+
+  const supNames = e => {
+    const ids = JSON.parse(e.supervisors || "[]");
+    return ids.map(id => byId[id] ? byId[id].name : "").filter(Boolean).join("، ") || "—";
+  };
+
+  // ورقة 1: ملخّص الموظفين
+  const sum = [["الموظف", "الإدارة", "المشرف", "المستهدف", "معتمدة", "متبقّي", "نسبة الإنجاز %", "متوسط الدرجة %", "متأخرة", "الأداء العام %"]];
+  emps.forEach(e => {
+    const mine = reps.filter(r => r.employee_id === e.id);
+    const t = (tgts.find(x => x.employee_id === e.id) || {}).target || 0;
+    const appr = mine.filter(r => r.status === "approved");
+    const late = mine.filter(r => r.status !== "approved" && new Date(r.due_date) < new Date()).length;
+    const pct = t ? Math.round(appr.length / t * 100) : 0;
+    const scores = appr.map(r => scoreReport(r, histBy[r.id], w)).filter(x => x != null);
+    const avg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+    sum.push([e.name, e.dept || "—", supNames(e), t, appr.length, Math.max(0, t - appr.length), pct, avg || "—", late, Math.round(pct * (avg || 0) / 100)]);
+  });
+
+  // ورقة 2: تفاصيل المهام
+  const det = [["الموظف", "اسم المهمة", "الحالة", "تاريخ الاستحقاق", "تاريخ التسليم", "الاكتمال %", "الجودة %", "الدرجة %", "متأخرة", "ملاحظة الموظف", "ملاحظة المشرف"]];
+  reps.sort((a, b) => (byId[a.employee_id] ? byId[a.employee_id].name : "").localeCompare(byId[b.employee_id] ? byId[b.employee_id].name : "", "ar") || a.slot_no - b.slot_no);
+  reps.forEach(r => {
+    const e = byId[r.employee_id]; if (!e) return;
+    const sc = scoreReport(r, histBy[r.id], w);
+    const late = r.status !== "approved" && new Date(r.due_date) < new Date();
+    det.push([e.name, r.title || "—", STATUS_AR[r.status] || r.status, r.due_date || "—", r.upload_date || "—",
+      r.m_completeness != null ? r.m_completeness : "—", r.m_quality != null ? r.m_quality : "—",
+      sc != null ? sc : "—", late ? "نعم" : "لا", r.submit_note || "—", r.review_note || r.return_reason || "—"]);
+  });
+
+  const wb = XLSX.utils.book_new();
+  const ws1 = XLSX.utils.aoa_to_sheet(sum);
+  ws1["!cols"] = [{ wch: 22 }, { wch: 20 }, { wch: 20 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 15 }, { wch: 9 }, { wch: 14 }];
+  const ws2 = XLSX.utils.aoa_to_sheet(det);
+  ws2["!cols"] = [{ wch: 22 }, { wch: 30 }, { wch: 13 }, { wch: 14 }, { wch: 14 }, { wch: 11 }, { wch: 10 }, { wch: 10 }, { wch: 9 }, { wch: 30 }, { wch: 30 }];
+  XLSX.utils.book_append_sheet(wb, ws1, "ملخص الموظفين");
+  XLSX.utils.book_append_sheet(wb, ws2, "تفاصيل المهام");
+
+  const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+  await D.logActivity(req.user.id, `صدّر تقرير الأداء (${quarter}) إلى Excel`, "export");
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="taklif-${quarter}.xlsx"`);
+  res.send(buf);
+}));
+
+/* =========================================================
    STATIC HOSTING (frontend embedded — no external folder)
    ========================================================= */
 const HTML = require("./frontend");
